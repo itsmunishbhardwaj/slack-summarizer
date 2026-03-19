@@ -1,10 +1,18 @@
 import os
 import time
 import datetime
+import logging
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import google.generativeai as genai
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -15,6 +23,8 @@ app = App(
     token=os.environ["SLACK_BOT_TOKEN"],
     signing_secret=os.environ["SLACK_SIGNING_SECRET"]
 )
+
+logger.info("🚀 Slack CatchUp Bot initialized")
 
 def summarize_messages(client, channel_id, user_id, messages, thread_ts=None, date_range=None):
     """Common function to summarize messages for both threads and channels"""
@@ -66,7 +76,7 @@ def summarize_messages(client, channel_id, user_id, messages, thread_ts=None, da
                         # Small delay to respect Slack's rate limits
                         time.sleep(0.1)
                     except Exception as e:
-                        print(f"⚠️ Could not get permalink: {e}")
+                        logger.warning(f"⚠️ Could not get permalink: {e}")
 
         # AI Prompt with structured output
         prompt = f"""Summarize these Slack messages for {real_name}. Keep it concise and actionable.
@@ -142,103 +152,159 @@ Mentioned Messages:
             )
 
     except Exception as e:
-        print(f"❌ Error during summarization: {e}")
+        logger.error(f"❌ Error during summarization: {e}", exc_info=True)
 
 @app.command("/catchup")
 def handle_command(ack, body, client):
+    """Handle the /catchup slash command"""
+    # MUST acknowledge within 3 seconds
+    logger.info("🔍 /catchup command received")
     ack()
+    logger.info("✅ Command acknowledged")
     
-    channel_id = body["channel_id"]
-    user_id = body["user_id"]
-    
-    # Check if command was called in a thread
-    thread_ts = body.get("thread_ts") or body.get("message", {}).get("thread_ts")
-    
-    if thread_ts:
-        # Handle thread summarization directly
-        try:
-            client.chat_postEphemeral(channel=channel_id, user=user_id, thread_ts=thread_ts, text=f"🔍 Reading thread messages...")
-            
-            # Fetch thread messages
-            result = client.conversations_replies(channel=channel_id, ts=thread_ts)
-            messages = result["messages"]
-            
-            if not messages:
-                client.chat_postEphemeral(channel=channel_id, user=user_id, thread_ts=thread_ts, text="No messages found in this thread.")
-                return
-            
-            # Process thread messages
-            summarize_messages(client, channel_id, user_id, messages, thread_ts=thread_ts)
-            
-        except Exception as e:
-            print(f"❌ Error processing thread: {e}")
-    else:
-        # Show modal for channel-wide summarization
+    try:
+        channel_id = body["channel_id"]
+        user_id = body["user_id"]
         trigger_id = body["trigger_id"]
+        
+        logger.info(f"📊 Command from user {user_id} in channel {channel_id}")
+        
+        # Calculate default date range
         today = datetime.datetime.now()
         week_ago = today - datetime.timedelta(days=7)
 
-        try:
-            client.views_open(
-                trigger_id=trigger_id,
-                view={
-                    "type": "modal",
-                    "callback_id": "date_selection_modal",
-                    "private_metadata": channel_id,
-                    "title": {"type": "plain_text", "text": "Catch Up"},
-                    "submit": {"type": "plain_text", "text": "Summarize"},
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "start_date_block",
-                            "element": {"type": "datepicker", "action_id": "start_date", "initial_date": week_ago.strftime('%Y-%m-%d')},
-                            "label": {"type": "plain_text", "text": "Start Date"}
+        logger.info(f"📅 Opening modal with default range: {week_ago.strftime('%Y-%m-%d')} to {today.strftime('%Y-%m-%d')}")
+        
+        # Open the date selection modal
+        client.views_open(
+            trigger_id=trigger_id,
+            view={
+                "type": "modal",
+                "callback_id": "date_selection_modal",
+                "private_metadata": channel_id,
+                "title": {"type": "plain_text", "text": "Catch Up"},
+                "submit": {"type": "plain_text", "text": "Summarize"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "start_date_block",
+                        "element": {
+                            "type": "datepicker",
+                            "action_id": "start_date",
+                            "initial_date": week_ago.strftime('%Y-%m-%d')
                         },
-                        {
-                            "type": "input",
-                            "block_id": "end_date_block",
-                            "element": {"type": "datepicker", "action_id": "end_date", "initial_date": today.strftime('%Y-%m-%d')},
-                            "label": {"type": "plain_text", "text": "End Date"}
-                        }
-                    ]
-                }
+                        "label": {"type": "plain_text", "text": "Start Date"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "end_date_block",
+                        "element": {
+                            "type": "datepicker",
+                            "action_id": "end_date",
+                            "initial_date": today.strftime('%Y-%m-%d')
+                        },
+                        "label": {"type": "plain_text", "text": "End Date"}
+                    }
+                ]
+            }
+        )
+        logger.info("✅ Modal opened successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in /catchup command handler: {e}", exc_info=True)
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=f"❌ Sorry, something went wrong: {str(e)}"
             )
-        except Exception as e:
-            print(f"❌ Error opening modal: {e}")
+        except Exception as inner_e:
+            logger.error(f"❌ Could not send error message: {inner_e}")
 
 @app.view("date_selection_modal")
 def handle_view_submission(ack, body, client, view):
+    """Handle modal submission"""
+    # MUST acknowledge immediately
+    logger.info("📝 Modal submission received")
     ack()
-    
-    user_id = body["user"]["id"]
-    channel_id = view["private_metadata"]
+    logger.info("✅ Modal acknowledged")
     
     try:
-        # Get dates
+        user_id = body["user"]["id"]
+        channel_id = view["private_metadata"]
+        
+        logger.info(f"📊 Processing submission from user {user_id} in channel {channel_id}")
+        
+        # Extract selected dates
         state_values = view["state"]["values"]
         start_str = state_values["start_date_block"]["start_date"]["selected_date"]
         end_str = state_values["end_date_block"]["end_date"]["selected_date"]
         
-        oldest = time.mktime(datetime.datetime.strptime(start_str, "%Y-%m-%d").timetuple())
-        latest = time.mktime(datetime.datetime.strptime(end_str, "%Y-%m-%d").timetuple()) + 86399
+        logger.info(f"📅 Date range selected: {start_str} to {end_str}")
+        
+        # Validate dates
+        start_date = datetime.datetime.strptime(start_str, "%Y-%m-%d")
+        end_date = datetime.datetime.strptime(end_str, "%Y-%m-%d")
+        
+        if start_date > end_date:
+            logger.warning(f"⚠️ Invalid date range")
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text="❌ Start date must be before end date. Please try again."
+            )
+            return
+        
+        # Convert to timestamps
+        oldest = time.mktime(start_date.timetuple())
+        latest = time.mktime(end_date.timetuple()) + 86399  # End of day
 
-        client.chat_postEphemeral(channel=channel_id, user=user_id, text=f"🔍 Reading messages...")
+        # Send status message
+        logger.info("📤 Sending status message...")
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text=f"🔍 Reading messages from {start_str} to {end_str}..."
+        )
 
-        # Fetch History
-        result = client.conversations_history(channel=channel_id, oldest=str(oldest), latest=str(latest))
+        # Fetch conversation history
+        logger.info("🔍 Fetching conversation history...")
+        result = client.conversations_history(
+            channel=channel_id,
+            oldest=str(oldest),
+            latest=str(latest)
+        )
         messages = result["messages"]
         
+        logger.info(f"✅ Fetched {len(messages)} messages")
+        
         if not messages:
-            client.chat_postEphemeral(channel=channel_id, user=user_id, text="No messages found in that range.")
+            logger.info("⚠️ No messages found")
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text="No messages found in that date range."
+            )
             return
 
-        # Use the common summarization function
+        # Summarize messages
+        logger.info("🤖 Starting AI summarization...")
         date_range = f"{start_str} to {end_str}"
         summarize_messages(client, channel_id, user_id, messages, date_range=date_range)
+        logger.info("✅ Summary sent successfully")
 
     except Exception as e:
-        print(f"❌ Error during submission: {e}")
+        logger.error(f"❌ Error during modal submission: {e}", exc_info=True)
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=f"❌ Sorry, something went wrong: {str(e)}"
+            )
+        except Exception as inner_e:
+            logger.error(f"❌ Could not send error message: {inner_e}")
 
 if __name__ == "__main__":
     handler = SocketModeHandler(app, os.environ["SLACK_APP_LEVEL_TOKEN"])
+    logger.info("⚡️ Starting Socket Mode handler...")
     handler.start()
